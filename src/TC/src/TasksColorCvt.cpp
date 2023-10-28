@@ -19,6 +19,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <array>
 
 using namespace VPF;
 using namespace std;
@@ -40,6 +41,57 @@ struct NppConvertSurface_Impl {
   CUstream cu_str;
   NppStreamContext nppCtx;
 };
+
+// constexpr std::array<Npp32f [4], 3> yuv_to_rgb(Npp32f Kr, Npp32f Kb, bool limited, uint8_t bits) {
+//   Npp32f y_const = limited ? -std::pow(2, (bits - 4)) : 0.;
+//   Npp32f c_const = -std::pow(2, (bits - 1));
+//   Npp32f y_ratio = limited ? (std::pow(2, bits) - 1.) / (219. * std::pow(2, (bits - 8))) : 1.;
+//   Npp32f c_ratio = limited ? (std::pow(2, bits) - 1.) / (224. * std::pow(2, (bits - 8))) : 1.;
+// 
+//   return {{
+//     {y_ratio * 1,                                                0, c_ratio *                           (2 - 2 * Kr), y_const},
+//     {y_ratio * 1, c_ratio * (2 * Kb * Kb - 2 * Kb) / (1 - Kr - Kb), c_ratio * (2 * Kr * Kr - 2 * Kr) / (1 - Kr - Kb), c_const},
+//     {y_ratio * 1, c_ratio *                           (2 - 2 * Kb),                                                0, c_const},
+//   }};
+// }
+
+constexpr std::array<Npp32f [4], 3> yuv_to_rgb(Npp32f Kr, Npp32f Kb, bool limited, uint8_t bits) {
+  Npp32f Kg = 1 - Kr - Kb;
+
+  Npp32f y_offset = limited ? -std::pow(2, (bits - 4)) : 0.;
+  Npp32f c_half = -std::pow(2, (bits - 1));
+
+  Npp32f y_ratio = limited ? (std::pow(2, bits) - 1.) / (219. * std::pow(2, (bits - 8))) : 1.;
+  Npp32f c_ratio = limited ? (std::pow(2, bits) - 1.) / (224. * std::pow(2, (bits - 8))) : 1.;
+
+  Npp32f y_const = y_offset * y_ratio;
+  Npp32f r_const = y_const + c_ratio * (2 - 2 * Kr) * c_half;
+  Npp32f g_const = y_const + c_ratio * (2 * Kb * Kb - 2 * Kb) / Kg * c_half + c_ratio * (2 * Kr * Kr - 2 * Kr) / Kg * c_half;
+  Npp32f b_const = y_const + c_ratio * (2 - 2 * Kb) * c_half;
+
+  return {{
+    {y_ratio * 1,                                     0, c_ratio *                           (2 - 2 * Kr), r_const},
+    {y_ratio * 1, c_ratio * (2 * Kb * Kb - 2 * Kb) / Kg, c_ratio *            (2 * Kr * Kr - 2 * Kr) / Kg, g_const},
+    {y_ratio * 1, c_ratio *                (2 - 2 * Kb),                                                0, b_const},
+  }};
+}
+
+constexpr std::array<Npp32f [4], 3> rgb_to_yuv(Npp32f Kr, Npp32f Kb, bool limited, uint8_t bits) {
+  Npp32f Kg = 1 - Kr - Kb;
+
+  Npp32f c_half = std::pow(2, (bits - 1));
+
+  Npp32f y_const = limited ? std::pow(2, (bits - 4)) : 0.;
+  Npp32f y_ratio = limited ? (219. * std::pow(2, (bits - 8))) / (std::pow(2, bits) - 1.) : 1.;
+  Npp32f c_ratio = limited ? (224. * std::pow(2, (bits - 8))) / (std::pow(2, bits) - 1.) : 1.;
+  Npp32f c_const = y_const + c_half * c_ratio;
+
+  return {{
+    {y_ratio *                Kr, y_ratio *                Kg, y_ratio *                Kb, y_const},
+    {c_ratio * Kr / (2 * Kb - 2), c_ratio * Kg / (2 * Kb - 2), c_ratio *              0.5f, c_const},
+    {c_ratio *              0.5f, c_ratio * Kg / (2 * Kr - 2), c_ratio * Kb / (2 * Kb - 2), c_const},
+  }};
+}
 
 struct nv12_bgr final : public NppConvertSurface_Impl {
   nv12_bgr(uint32_t width, uint32_t height, CUcontext context,
@@ -140,15 +192,6 @@ struct nv12_rgb final : public NppConvertSurface_Impl {
     auto err = NPP_NO_ERROR;
 
     switch (color_space) {
-    case BT_709:
-      if (JPEG == color_range) {
-        err = nppiNV12ToRGB_709HDTV_8u_P2C3R_Ctx(
-            pSrc, pInput->Pitch(), pDst, pSurface->Pitch(), oSizeRoi, nppCtx);
-      } else {
-        err = nppiNV12ToRGB_709CSC_8u_P2C3R_Ctx(
-            pSrc, pInput->Pitch(), pDst, pSurface->Pitch(), oSizeRoi, nppCtx);
-      }
-      break;
     case BT_601:
       if (JPEG == color_range) {
         err = nppiNV12ToRGB_8u_P2C3R_Ctx(pSrc, pInput->Pitch(), pDst,
@@ -163,9 +206,15 @@ struct nv12_rgb final : public NppConvertSurface_Impl {
         return nullptr;
       }
       break;
+    case BT_709:
     default:
-      cerr << __FUNCTION__ << ": unsupported color space." << endl;
-      return nullptr;
+      if (JPEG == color_range) {
+        err = nppiNV12ToRGB_709HDTV_8u_P2C3R_Ctx(
+            pSrc, pInput->Pitch(), pDst, pSurface->Pitch(), oSizeRoi, nppCtx);
+      } else {
+        err = nppiNV12ToRGB_709CSC_8u_P2C3R_Ctx(
+            pSrc, pInput->Pitch(), pDst, pSurface->Pitch(), oSizeRoi, nppCtx);
+      }
     }
 
     if (NPP_NO_ERROR != err) {
@@ -933,6 +982,109 @@ struct rgb_yuv420 final : public NppConvertSurface_Impl {
   Surface *pSurface = nullptr;
 };
 
+// This "YUV420_10bit" is actually P10 (semi-planar), the format is used for nvenc code compatibility
+struct rgb_yuv420_10bit final : public NppConvertSurface_Impl {
+  rgb_yuv420_10bit(uint32_t width, uint32_t height, CUcontext context,
+             CUstream stream)
+      : NppConvertSurface_Impl(context, stream) {
+    pSurface = Surface::Make(YUV420_10bit, width, height, context);
+    pScratchRGB16 = new SurfacePlane(width * 3, height, sizeof(uint16_t), context);
+    pScratchRGB16Scaled = new SurfacePlane(width * 3, height, sizeof(uint16_t), context);
+  }
+
+  ~rgb_yuv420_10bit() {
+    delete pSurface;
+    delete pScratchRGB16;
+    delete pScratchRGB16Scaled;
+  }
+
+  Token *Execute(Token *pInput, ColorspaceConversionContext *pCtx) override {
+    NvtxMark tick("nppiRGBToYUV420P10");
+    auto pInputRGB8 = (SurfaceRGB *)pInput;
+
+    CudaCtxPush ctxPush(cu_ctx);
+
+    auto const color_range = pCtx ? pCtx->color_range : JPEG;
+    auto const color_space = pCtx ? pCtx->color_space : BT_601;
+
+    const Npp32f (*colorCvtMatrix)[4];
+
+    switch (color_space) {
+      case BT_601:
+        colorCvtMatrix = (color_range == JPEG) ? RGB_YUV_BT601_FULL.data() : RGB_YUV_BT601_LIMITED.data();
+        break;
+      case BT_709:
+      default:
+        colorCvtMatrix = (color_range == JPEG) ? RGB_YUV_BT709_FULL.data() : RGB_YUV_BT709_LIMITED.data();
+    }
+
+    {
+      const Npp8u *pSrc = (const Npp8u *)pInputRGB8->PlanePtr();
+      int srcStep = pInputRGB8->Pitch();
+      Npp16u *pDst = (Npp16u *)pScratchRGB16->GpuMem();
+      int dstStep = pScratchRGB16->Pitch();
+      NppiSize roi = { (int)pScratchRGB16->Width(), (int)pScratchRGB16->Height() };
+
+      auto err = NPP_NO_ERROR;
+
+      err = nppiConvert_8u16u_C1R_Ctx(pSrc, srcStep, pDst, dstStep, roi, nppCtx);
+      if (NPP_NO_ERROR != err) {
+        cerr << "Failed to convert surface. Error code: " << err << endl;
+        return nullptr;
+      }
+    }
+
+    // Scales 8-bit to 16-bit color;
+    {
+      const Npp16u* pSrc = (const Npp16u*)pScratchRGB16->GpuMem();
+      int nSrcStep = pScratchRGB16->Pitch();
+      Npp16u nConstant = 1 << (16 - 8);
+      Npp16u* pDst = (Npp16u*)pScratchRGB16Scaled->GpuMem();
+      int nDstStep = pScratchRGB16Scaled->Pitch();
+      NppiSize oSizeRoi = {0};
+      oSizeRoi.height = pScratchRGB16->Height();
+      oSizeRoi.width = pScratchRGB16->Width();
+      int nScaleFactor = 0;
+      auto err = nppiMulC_16u_C1RSfs_Ctx(pSrc, nSrcStep, nConstant, pDst, nDstStep,
+                                         oSizeRoi, nScaleFactor, nppCtx);
+      if (NPP_NO_ERROR != err) {
+        cerr << "Failed to convert surface. Error code: " << err << endl;
+        return nullptr;
+      }
+    }
+
+    // Convert 16-bit RGB to 16-bit YUV420sp, which can be directly used as P10, because of NVENC taking significant bits
+    {
+      const Npp16u *pSrc = (const Npp16u *)pScratchRGB16Scaled->GpuMem();
+      int srcStep = pScratchRGB16Scaled->Pitch();
+      Npp16u *pDst[] = {(Npp16u *)pSurface->PlanePtr(0U),
+                        (Npp16u *)pSurface->PlanePtr(1U)};
+      int dstStep[] = { (int)pSurface->Pitch(0U), (int)pSurface->Pitch(1U) };
+      NppiSize roi = {(int)pSurface->Width(), (int)pSurface->Height()};
+
+      auto err = NPP_NO_ERROR;
+
+      err = nppiRGBToNV12_16u_ColorTwist32f_C3P2R_Ctx(pSrc, srcStep, pDst, dstStep, roi, colorCvtMatrix, nppCtx);
+
+      if (NPP_NO_ERROR != err) {
+        cerr << "Failed to convert surface. Error code: " << err << endl;
+        return nullptr;
+      }
+    }
+
+    return pSurface;
+  }
+
+  Surface *pSurface = nullptr;
+  SurfacePlane *pScratchRGB16 = nullptr;
+  SurfacePlane *pScratchRGB16Scaled = nullptr;
+
+  const std::array<Npp32f [4], 3> RGB_YUV_BT709_LIMITED = rgb_to_yuv(0.2126, 0.0722, true, 16);
+  const std::array<Npp32f [4], 3> RGB_YUV_BT709_FULL = rgb_to_yuv(0.2126, 0.0722, false, 16);
+  const std::array<Npp32f [4], 3> RGB_YUV_BT601_LIMITED = rgb_to_yuv(0.299, 0.114, true, 16);
+  const std::array<Npp32f [4], 3> RGB_YUV_BT601_FULL = rgb_to_yuv(0.229, 0.114, false, 16);
+};
+
 struct yuv420_nv12 final : public NppConvertSurface_Impl {
   yuv420_nv12(uint32_t width, uint32_t height, CUcontext context,
               CUstream stream)
@@ -1045,6 +1197,156 @@ struct p16_nv12 final : public NppConvertSurface_Impl {
 
   Surface* pSurface = nullptr;
   SurfacePlane* pScratch = nullptr;
+};
+
+template <int bit_depth>
+struct p16_rgb final : public NppConvertSurface_Impl {
+  p16_rgb(uint32_t width, uint32_t height, CUcontext context, CUstream stream)
+      : NppConvertSurface_Impl(context, stream) {
+    pSurface = Surface::Make(RGB, width, height, context);
+    pScratchRGB16 = new SurfacePlane(width * 3, height, sizeof(uint16_t), context);
+    pScratchRGB16Scaled = new SurfacePlane(width * 3, height, sizeof(uint16_t), context);
+  }
+
+  ~p16_rgb() {
+    delete pSurface;
+    delete pScratchRGB16;
+    delete pScratchRGB16Scaled;
+  }
+
+  Token* Execute(Token* pInputP16, ColorspaceConversionContext* pCtx) override {
+    NvtxMark tick("p16_rgb");
+    if (!pInputP16) {
+      return nullptr;
+    }
+
+    if (pSurface->ElemSize() > bit_depth) {
+      return nullptr;
+    }
+
+    auto pInput = (Surface*)pInputP16;
+    CudaCtxPush ctxPush(cu_ctx);
+    // for (int i = 0; i < pInput->NumPlanes(); i++) {
+    //   // Convert bit_depth to 16-bit color, save result in 16-bit scratch buffer;
+    //   {
+    //     const Npp16u* pSrc1 = (const Npp16u*)pInput->PlanePtr(i);
+    //     int nSrc1Step = pInput->Pitch(i);
+    //     Npp16u nConstant = 1 << (16 - bit_depth);
+    //     Npp16u* pDst = (Npp16u*)pScratchP16[i]->GpuMem();
+    //     int nDstStep = pScratchP16[i]->Pitch();
+    //     NppiSize oSizeRoi = {0};
+    //     oSizeRoi.height = pInput->Height(i);
+    //     oSizeRoi.width = pInput->Width(i);
+    //     int nScaleFactor = 0;
+    //     auto err = nppiMulC_16u_C1RSfs_Ctx(pSrc1, nSrc1Step, nConstant, pDst, nDstStep,
+    //                                        oSizeRoi, nScaleFactor, nppCtx);
+    //     if (NPP_NO_ERROR != err) {
+    //       cerr << "Failed to convert surface. Error code: " << err << endl;
+    //       return nullptr;
+    //     }
+    //   }
+    // }
+    
+    // Convert from 16-bit NV12 to 16-bit YUV444 (STORED in packed RGB format)
+    // This is the only 16-bit NPP function we can use now, but currently the ColorTwist has a bug that
+    // the YUV values are first applied offsets (in Npp16u instead of Npp32f), which makes the negative
+    // Cb and Cr offsets overflow. So we have to use ColorTwist separately.
+    {
+      const Npp32f colorCvtMatrix[3][4] = {
+        { 1, 0, 0, 0 },
+        { 0, 1, 0, 0 },
+        { 0, 0, 1, 0 },
+      };
+
+      const Npp16u* pSrc[2] = { (Npp16u*)pInput->PlanePtr(0), (Npp16u*)pInput->PlanePtr(1) };
+      int nSrcStep[2] = { (int)pInput->Pitch(0), (int)pInput->Pitch(1) };
+      Npp16u* pDst = (Npp16u*)pScratchRGB16->GpuMem();
+      int nDstStep = pScratchRGB16->Pitch();
+      NppiSize oSizeRoi = {0};
+      oSizeRoi.height = pInput->Height(0);
+      oSizeRoi.width = pInput->Width(0);
+      auto err = nppiNV12ToRGB_16u_ColorTwist32f_P2C3R_Ctx(pSrc, nSrcStep, pDst, nDstStep,
+                                                           oSizeRoi, colorCvtMatrix, nppCtx);
+      if (NPP_NO_ERROR != err) {
+        cerr << "Failed to convert surface. Error code: " << err << endl;
+        return nullptr;
+      }
+    }
+
+    {
+      auto const color_range = pCtx ? pCtx->color_range : JPEG;
+      auto const color_space = pCtx ? pCtx->color_space : BT_601;
+
+      const Npp32f (*colorCvtMatrix)[4];
+
+      switch (color_space) {
+        case BT_601:
+          colorCvtMatrix = (color_range == JPEG) ? YUV_RGB_BT601_FULL.data() : YUV_RGB_BT601_LIMITED.data();
+          break;
+        case BT_709:
+        default:
+          colorCvtMatrix = (color_range == JPEG) ? YUV_RGB_BT709_FULL.data() : YUV_RGB_BT709_LIMITED.data();
+      }
+
+      Npp16u* pSrcDst = (Npp16u *)pScratchRGB16->GpuMem();
+      int nSrcDstStep = pScratchRGB16->Pitch();
+      NppiSize oSizeRoi = {0};
+      oSizeRoi.height = pInput->Height(0);
+      oSizeRoi.width = pInput->Width(0);
+      auto err = nppiColorTwist32f_16u_C3IR_Ctx(pSrcDst, nSrcDstStep, oSizeRoi, colorCvtMatrix, nppCtx);
+      if (NPP_NO_ERROR != err) {
+        cerr << "Failed to convert surface. Error code: " << err << endl;
+        return nullptr;
+      }
+    }
+
+    // Scales the 16-bit color back to 8-bit (16u8u conversion just clamps data);
+    {
+      const Npp16u* pSrc = (const Npp16u*)pScratchRGB16->GpuMem();
+      int nSrcStep = pScratchRGB16->Pitch();
+      Npp16u nConstant = 1 << (16 - 8);
+      Npp16u* pDst = (Npp16u*)pScratchRGB16Scaled->GpuMem();
+      int nDstStep = pScratchRGB16Scaled->Pitch();
+      NppiSize oSizeRoi = {0};
+      oSizeRoi.height = pScratchRGB16->Height();
+      oSizeRoi.width = pScratchRGB16->Width();
+      int nScaleFactor = 0;
+      auto err = nppiDivC_16u_C1RSfs_Ctx(pSrc, nSrcStep, nConstant, pDst, nDstStep,
+                                         oSizeRoi, nScaleFactor, nppCtx);
+      if (NPP_NO_ERROR != err) {
+        cerr << "Failed to convert surface. Error code: " << err << endl;
+        return nullptr;
+      }
+    }
+
+    // Bit depth conversion from 16-bit scratch to output;
+    {
+      const Npp16u* pSrc = (Npp16u*)pScratchRGB16Scaled->GpuMem();
+      int nSrcStep = pScratchRGB16Scaled->Pitch();
+      Npp8u* pDst = (Npp8u*)pSurface->PlanePtr();
+      int nDstStep = pSurface->Pitch();
+      NppiSize oSizeRoi = {0};
+      oSizeRoi.height = pScratchRGB16Scaled->Height();
+      oSizeRoi.width = pScratchRGB16Scaled->Width();
+      auto err = nppiConvert_16u8u_C1R_Ctx(pSrc, nSrcStep, pDst, nDstStep,
+                                           oSizeRoi, nppCtx);
+      if (NPP_NO_ERROR != err) {
+        cerr << "Failed to convert surface. Error code: " << err << endl;
+        return nullptr;
+      }
+    }
+
+    return pSurface;
+  }
+
+  Surface* pSurface = nullptr;
+  SurfacePlane* pScratchRGB16 = nullptr;
+  SurfacePlane* pScratchRGB16Scaled = nullptr;
+
+  const std::array<Npp32f [4], 3> YUV_RGB_BT709_LIMITED = yuv_to_rgb(0.2126, 0.0722, true, 16);
+  const std::array<Npp32f [4], 3> YUV_RGB_BT709_FULL = yuv_to_rgb(0.2126, 0.0722, false, 16);
+  const std::array<Npp32f [4], 3> YUV_RGB_BT601_LIMITED = yuv_to_rgb(0.299, 0.114, true, 16);
+  const std::array<Npp32f [4], 3> YUV_RGB_BT601_FULL = yuv_to_rgb(0.229, 0.114, false, 16);
 };
 
 struct rgb8_deinterleave final : public NppConvertSurface_Impl {
@@ -1318,6 +1620,8 @@ ConvertSurface::ConvertSurface(uint32_t width, uint32_t height,
     pImpl = new p16_nv12<16>(width, height, ctx, str);
   } else if (P12 == inFormat && NV12 == outFormat) {
     pImpl = new p16_nv12<16>(width, height, ctx, str);
+  } else if (P10 == inFormat && RGB == outFormat) {
+    pImpl = new p16_rgb<10>(width, height, ctx, str);
   } else if (NV12 == inFormat && RGB == outFormat) {
     pImpl = new nv12_rgb(width, height, ctx, str);
   } else if (NV12 == inFormat && BGR == outFormat) {
@@ -1334,6 +1638,8 @@ ConvertSurface::ConvertSurface(uint32_t width, uint32_t height,
     pImpl = new yuv420_rgb(width, height, ctx, str);
   } else if (RGB == inFormat && YUV420 == outFormat) {
     pImpl = new rgb_yuv420(width, height, ctx, str);
+  } else if (RGB == inFormat && YUV420_10bit == outFormat) {
+    pImpl = new rgb_yuv420_10bit(width, height, ctx, str);
   } else if (RGB == inFormat && YUV444 == outFormat) {
     pImpl = new rgb_yuv444(width, height, ctx, str);
   } else if (BGR == inFormat && YCBCR == outFormat) {
